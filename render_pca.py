@@ -1,180 +1,112 @@
-import torch
+#
+# Copyright (C) 2023, Inria
+# GRAPHDECO research group, https://team.inria.fr/graphdeco
+# All rights reserved.
+#
+# This software is free for non-commercial, research and evaluation use 
+# under the terms of the LICENSE.md file.
+#
+# For inquiries contact  george.drettakis@inria.fr
+#
 import numpy as np
-import faiss
+import torch
+from scene import Scene
 import os
-import clip
-import viser
-import viser.transforms as tf
-import time
-import matplotlib
-import matplotlib.cm as cm
+from tqdm import tqdm
+from os import makedirs
+from gaussian_renderer import render
+import torchvision
+from utils.general_utils import safe_state
 from argparse import ArgumentParser
-from gaussian_renderer import GaussianModel
 from arguments import ModelParams, PipelineParams, get_combined_args
+from gaussian_renderer import GaussianModel
+import faiss
 
-def get_colormap_safe(name):
-    try:
-        return matplotlib.colormaps[name]
-    except AttributeError:
-        return cm.get_cmap(name)
 
-def apply_heatmap(similarities, base_rgbs, threshold=0.20, colormap_name='turbo'):
-    """
-    Maps similarity scores to a heatmap gradient.
-    """
-    # 0. Handle NaNs
-    similarities = torch.nan_to_num(similarities, nan=0.0, posinf=1.0, neginf=0.0)
+def render_set(model_path, source_path, name, iteration, views, gaussians, pipeline, background, args):
+    render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders_pca")
+    gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
+    render_npy_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders_npy")
+    gts_npy_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt_npy")
 
-    # 1. Normalize [threshold, max] -> [0, 1]
-    max_sim = similarities.max()
-    
-    # If nothing is relevant, return dimmed scene
-    if max_sim <= threshold:
-        return base_rgbs * 0.1
+    makedirs(render_npy_path, exist_ok=True)
+    makedirs(gts_npy_path, exist_ok=True)
+    makedirs(render_path, exist_ok=True)
+    makedirs(gts_path, exist_ok=True)
 
-    # Stability epsilon
-    norm_sim = (similarities - threshold) / (max_sim - threshold + 1e-8)
-    norm_sim = torch.clamp(norm_sim, 0, 1)
+    for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
+        output = render(view, gaussians, pipeline, background, args)
 
-    # 2. Apply Colormap
-    cmap = get_colormap_safe(colormap_name)
-    heatmap_colors_cpu = cmap(norm_sim.cpu().numpy())[:, :3] # (N, 3) RGB
-    heatmap_colors = torch.tensor(heatmap_colors_cpu, device=base_rgbs.device, dtype=torch.float32)
-    
-    # 3. Blend
-    mask = (similarities > threshold).float().unsqueeze(-1) 
-    background_color = base_rgbs * 0.2
-    final_colors = heatmap_colors * mask + background_color * (1 - mask)
-    
-    return final_colors
+        if not args.include_feature:
+            rendering = output["render"]
+        else:
+            rendering = output["language_feature_image"]
+            
 
-def main(args, dataset_args, pipeline_args):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    torch.cuda.empty_cache()
+        if not args.include_feature:
+            gt = view.original_image[0:3, :, :]
+            
+        else:
+            gt, mask = view.get_language_feature(os.path.join(source_path, args.language_features_name), feature_level=args.feature_level)
 
-    print(f"\n[1/5] Loading OpenAI CLIP Model...")
+        np.save(os.path.join(render_npy_path, '{0:05d}'.format(idx) + ".npy"),rendering.permute(1,2,0).cpu().numpy())
+        np.save(os.path.join(gts_npy_path, '{0:05d}'.format(idx) + ".npy"),gt.permute(1,2,0).cpu().numpy())
+        torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
+        torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
     
-    # If you get a dimension mismatch error (512 vs 768), switch this string.
-    model_name = "ViT-B/32" 
-    
-    print(f"       -> Loading {model_name}...")
-    clip_model, preprocess = clip.load(model_name, device=device)
-    
-    print(f"[2/5] Loading Gaussian Model from {args.model_path}...")
-    gaussians = GaussianModel(dataset_args.sh_degree)
-    checkpoint_path = os.path.join(args.model_path, "chkpnt0.pth") 
-    
-    (model_params, first_iter) = torch.load(checkpoint_path)
-    gaussians.restore(model_params, args, mode='test')
-    
-    print("[3/5] Loading FAISS Index and Decoding Features...")
-    index = faiss.read_index(args.pq_index)
-    
-    language_features_idx = gaussians._language_feature.clone()
-    check_valid = torch.sum(language_features_idx, 1)
-    invalid_index = check_valid == 255 * (index.coarse_code_size() + index.code_size)
-    
-    decoded_features_cpu = np.zeros((language_features_idx.shape[0], 512), dtype=np.float32)
-    valid_mask_cpu = (invalid_index.cpu() == False).numpy()
-    
-    decoded_features_cpu[valid_mask_cpu] = index.sa_decode(
-        language_features_idx[valid_mask_cpu].cpu().numpy()
-    )
-    
-    # Move to GPU
-    gaussian_features = torch.tensor(decoded_features_cpu, device=device, dtype=torch.float32)
-    
-    # Cleanup CPU memory
-    del decoded_features_cpu
-    del language_features_idx
-    torch.cuda.empty_cache()
-    
-    # Normalize features
-    norm = gaussian_features.norm(dim=-1, keepdim=True)
-    gaussian_features = gaussian_features / (norm + 1e-9)
-
-    print(f"\n[4/5] Processing Query: '{args.query}'")
+               
+def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, args, index):
     with torch.no_grad():
-        # OpenAI CLIP Tokenization
-        text_tokens = clip.tokenize([args.query]).to(device)
+        gaussians = GaussianModel(dataset.sh_degree)
+        scene = Scene(dataset, gaussians, shuffle=False)
+        checkpoint = os.path.join(args.model_path, 'chkpnt0.pth')
+        (model_params, first_iter) = torch.load(checkpoint)
+        gaussians.restore(model_params, args, mode='test')
         
-        # Encode Text
-        text_features = clip_model.encode_text(text_tokens).float()
-        text_features /= text_features.norm(dim=-1, keepdim=True)
-        
-        # Similarity
-        similarity = (gaussian_features @ text_features.T).squeeze()
-        similarity = torch.nan_to_num(similarity, nan=0.0)
+        bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
+        background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-        # Stats
-        max_sim = similarity.max().item()
-        mean_sim = similarity.mean().item()
-        print(f"       -> Max Similarity: {max_sim:.4f}")
-        print(f"       -> Avg Similarity: {mean_sim:.4f}")
-        
-        # Auto-adjust threshold
-        target_threshold = args.threshold
-        if target_threshold > max_sim:
-            print(f"       [Info] Threshold {target_threshold} > Max Score {max_sim:.4f}.")
-            target_threshold = max_sim * 0.75
-            print(f"       -> Auto-lowered threshold to {target_threshold:.4f}")
+        language_features = gaussians._language_feature.clone()
+        check_valid = torch.sum(language_features, 1)
+        invalid_index = check_valid == 255 * (index.coarse_code_size()+index.code_size)
 
-        print("       -> Generating Heatmap Colors...")
-        shs = gaussians.get_features
-        base_rgbs_gpu = (shs[:, 0, :].detach() * 0.28209479177387814 + 0.5).clamp(0, 1)
-        
-        heatmap_rgbs_gpu = apply_heatmap(
-            similarity, 
-            base_rgbs_gpu, 
-            threshold=target_threshold,
-            colormap_name='turbo' 
-        )
-        
-        heatmap_rgbs = heatmap_rgbs_gpu.cpu().numpy().astype(np.float32)
+        clip_features = np.zeros((language_features.shape[0], 512))
+        language_features = language_features.cpu().numpy()
+        clip_features[invalid_index.cpu() == False] = index.sa_decode(language_features[invalid_index.cpu() == False])
+        clip_features = torch.Tensor(clip_features).cuda()
 
-    print("[5/5] Preparing Geometry...")
-    means = gaussians.get_xyz.detach().cpu().numpy()
-    opacities = gaussians.get_opacity.detach().cpu().numpy()
-    if opacities.ndim == 1: opacities = opacities[:, None]
-    
-    scales = gaussians.get_scaling.detach().cpu().numpy()
-    quats = gaussians.get_rotation.detach().cpu().numpy()
-    Rs = tf.SO3(quats).as_matrix()
-    covariances = np.einsum("nij,njk,nlk->nil", Rs, np.eye(3)[None, :, :] * scales[:, None, :] ** 2, Rs)
+        U, S, V = torch.pca_lowrank(clip_features, q=3)
+        pca_rgb = torch.matmul(clip_features, V.cuda())
+        pca_rgb = ((pca_rgb - torch.mean(pca_rgb, 0))) / (torch.std(pca_rgb,0)*5) + 0.5
+        
+        gaussians._features_dc = (pca_rgb - 0.5) / 0.28209479177387814
+        gaussians._features_dc = gaussians._features_dc.cuda().unsqueeze(1)
+        gaussians._features_rest[:,:,:] = 0
 
-    print(f"\n------------------------------------------------")
-    print(f"Starting Viser Server on Port {args.port}...")
-    server = viser.ViserServer(port=args.port)
-    
-    server.scene.add_gaussian_splats(
-        "/heatmap_scene",
-        centers=means,
-        rgbs=heatmap_rgbs, 
-        opacities=opacities,
-        covariances=covariances
-    )
-    
-    print(f"SUCCESS! Heatmap for '{args.query}' is active.")
-    print(f"Open your browser at: http://localhost:{args.port}")
-    print(f"------------------------------------------------\n")
-    
-    while True:
-        time.sleep(1.0)
+        if not skip_train:
+            render_set(dataset.model_path, dataset.source_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, args)
+
+        if not skip_test:
+             render_set(dataset.model_path, dataset.source_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, args)
 
 if __name__ == "__main__":
-    parser = ArgumentParser(description="Heatmap Search (OpenAI CLIP Backup)")
-    lp = ModelParams(parser)
-    op = PipelineParams(parser)
+    # Set up command line argument parser
     
-    parser.add_argument("--query", type=str, required=True, help="Text to search for")
-    parser.add_argument("--threshold", type=float, default=0.20, help="Similarity threshold") 
-    parser.add_argument("--pq_index", type=str, required=True, help="Path to FAISS index")
-    parser.add_argument("--port", type=int, default=8080, help="Viser server port")
-    
+    parser = ArgumentParser(description="Testing script parameters")
+    model = ModelParams(parser, sentinel=True)
+    pipeline = PipelineParams(parser)
+    parser.add_argument("--iteration", default=-1, type=int)
+    parser.add_argument("--skip_train", action="store_true")
+    parser.add_argument("--skip_test", action="store_true")
+    parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--include_feature", action="store_true")
+    parser.add_argument("--pq_index", type=str, default=None)
+
     args = get_combined_args(parser)
-    
-    if not os.path.exists(args.model_path):
-        print(f"Error: The model path '{args.model_path}' does not exist.")
-        exit(1)
-        
-    main(args, lp.extract(args), op.extract(args))
+    print("Rendering " + args.model_path)
+
+    safe_state(args.quiet)
+
+    index = faiss.read_index(args.pq_index)
+
+    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, args, index)

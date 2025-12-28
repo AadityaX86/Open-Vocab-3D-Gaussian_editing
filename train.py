@@ -62,7 +62,7 @@ def compute_average(features):
 
 
 def majority_voting(gaussians, scene, pipe, background, dataset, args):
-    lf_path = r"D:\_Major Project\Code\Dr-Splat\data\bicycle\language_features"
+    lf_path = r"D:\_Major Project\Code\Language Embedded Splats\data\garden\language_features"
     print("Language feature path:", lf_path)
     if args.use_pq:
         voting_mat = -1 * torch.ones((gaussians._opacity.shape[0], 17), dtype=torch.uint8, device="cuda")

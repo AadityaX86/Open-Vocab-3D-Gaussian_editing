@@ -19,7 +19,7 @@ def get_colormap_safe(name):
         return cm.get_cmap(name)
 
 def apply_overlay_heatmap(similarities, base_rgbs, threshold=0.2, colormap_name='turbo'):
-    """threshold
+    """
     Overlays a heatmap ONLY on relevant objects. 
     Leaves everything else as the original photorealistic color.
     """
@@ -27,7 +27,6 @@ def apply_overlay_heatmap(similarities, base_rgbs, threshold=0.2, colormap_name=
     similarities = torch.nan_to_num(similarities, nan=0.0, posinf=1.0, neginf=0.0)
 
     # 1. Normalize scores [threshold, max] -> [0, 1]
-    # We only care about normalizing the "active" range.
     max_sim = similarities.max()
     
     # If nothing matches, just return the original scene untouched
@@ -47,8 +46,7 @@ def apply_overlay_heatmap(similarities, base_rgbs, threshold=0.2, colormap_name=
     # mask = 1.0 if relevant, 0.0 if not
     mask = (similarities > threshold).float().unsqueeze(-1) 
     
-    # --- KEY CHANGE IS HERE ---
-    # Background is now just 'base_rgbs' (No dimming/darkening)
+    # Background is now just 'base_rgbs'
     background_color = base_rgbs 
     
     # Mix: Heatmap on matches + Original on non-matches
@@ -93,52 +91,17 @@ def main(args, dataset_args, pipeline_args):
         language_features_idx[valid_mask_cpu].cpu().numpy()
     )
     
+    # Move to GPU for fast dot product
     gaussian_features = torch.tensor(decoded_features_cpu, device=device, dtype=torch.float32)
     del decoded_features_cpu
     torch.cuda.empty_cache()
     
-    # Normalize
+    # Normalize features once
     norm = gaussian_features.norm(dim=-1, keepdim=True)
     gaussian_features = gaussian_features / (norm + 1e-9)
 
-    # 3. Perform Search
-    print(f"\n[4/5] Processing Query: '{args.query}'")
-    with torch.no_grad():
-        text_tokens = tokenizer([args.query]).to(device)
-        text_features = clip_model.encode_text(text_tokens).float()
-        text_features /= text_features.norm(dim=-1, keepdim=True)
-        
-        # Calculate Similarity
-        similarity = (gaussian_features @ text_features.T).squeeze()
-        similarity = torch.nan_to_num(similarity, nan=0.0)
-
-        # Stats
-        max_sim = similarity.max().item()
-        print(f"       -> Max Similarity: {max_sim:.4f}")
-
-        # Auto-adjust threshold
-        target_threshold = args.threshold
-        if target_threshold > max_sim:
-            print(f"       [Info] Threshold {target_threshold} > Max Score {max_sim:.4f}.")
-            target_threshold = max_sim * 0.85 # Keep it tight to the max
-            print(f"       -> Auto-lowered threshold to {target_threshold:.4f}")
-
-        print("       -> Generating Overlay Heatmap...")
-        shs = gaussians.get_features
-        base_rgbs_gpu = (shs[:, 0, :].detach() * 0.28209479177387814 + 0.5).clamp(0, 1)
-        
-        # --- APPLY OVERLAY ---
-        final_rgbs_gpu = apply_overlay_heatmap(
-            similarity, 
-            base_rgbs_gpu, 
-            threshold=target_threshold,
-            colormap_name='turbo' 
-        )
-        
-        final_rgbs = final_rgbs_gpu.cpu().numpy().astype(np.float32)
-
-    # 4. Prepare Geometry
-    print("[5/5] Preparing Geometry...")
+    # 3. Pre-calculate Geometry (This doesn't change during interaction)
+    print("[4/5] Pre-calculating Geometry and Base Colors...")
     means = gaussians.get_xyz.detach().cpu().numpy()
     opacities = gaussians.get_opacity.detach().cpu().numpy()
     if opacities.ndim == 1: opacities = opacities[:, None]
@@ -148,20 +111,89 @@ def main(args, dataset_args, pipeline_args):
     Rs = tf.SO3(quats).as_matrix()
     covariances = np.einsum("nij,njk,nlk->nil", Rs, np.eye(3)[None, :, :] * scales[:, None, :] ** 2, Rs)
 
-    # 5. Launch Viser
+    # Get Base RGBs (Photorealistic)
+    shs = gaussians.get_features
+    base_rgbs_gpu = (shs[:, 0, :].detach() * 0.28209479177387814 + 0.5).clamp(0, 1)
+
+    # 4. Initialize Viser
     print(f"\n------------------------------------------------")
     print(f"Starting Viser Server on Port {args.port}...")
+    print(f"Interactive Mode Enabled.")
     server = viser.ViserServer(port=args.port)
+
+    # --- GUI ELEMENTS ---
+    with server.gui.add_folder("Semantic Search"):
+        gui_text = server.gui.add_text(
+            "Query", 
+            initial_value=args.query if args.query else ""
+        )
+        gui_threshold = server.gui.add_slider(
+            "Threshold", 
+            min=0.0, max=1.0, step=0.01, 
+            initial_value=args.threshold
+        )
+        gui_status = server.gui.add_text("Status", initial_value="Ready", disabled=True)
+
+    # --- INTERACTIVE UPDATE FUNCTION ---
+    def update_scene(_):
+        """Callback to run whenever text or slider changes"""
+        query_text = gui_text.value
+        current_thresh = gui_threshold.value
+        
+        if not query_text:
+            # If empty text, show original scene
+            server.scene.add_gaussian_splats(
+                "/scene",
+                centers=means,
+                rgbs=base_rgbs_gpu.cpu().numpy(),
+                opacities=opacities,
+                covariances=covariances
+            )
+            gui_status.value = "Showing Original"
+            return
+
+        gui_status.value = f"Processing '{query_text}'..."
+
+        with torch.no_grad():
+            # 1. Encode Text
+            text_tokens = tokenizer([query_text]).to(device)
+            text_features = clip_model.encode_text(text_tokens).float()
+            text_features /= text_features.norm(dim=-1, keepdim=True)
+            
+            # 2. Calculate Similarity
+            similarity = (gaussian_features @ text_features.T).squeeze()
+            similarity = torch.nan_to_num(similarity, nan=0.0)
+
+            max_sim = similarity.max().item()
+            
+            # 3. Apply Heatmap
+            final_rgbs_gpu = apply_overlay_heatmap(
+                similarity, 
+                base_rgbs_gpu, 
+                threshold=current_thresh,
+                colormap_name='turbo' 
+            )
+            
+            final_rgbs = final_rgbs_gpu.cpu().numpy().astype(np.float32)
+
+            # 4. Update Viser Scene
+            server.scene.add_gaussian_splats(
+                "/scene",
+                centers=means,
+                rgbs=final_rgbs, 
+                opacities=opacities,
+                covariances=covariances
+            )
+            
+            gui_status.value = f"Max Sim: {max_sim:.4f}"
+
+    # Bind the callback to the GUI elements
+    gui_text.on_update(update_scene)
+    gui_threshold.on_update(update_scene)
+
+    # Initial trigger to render the scene
+    update_scene(None)
     
-    server.scene.add_gaussian_splats(
-        "/scene",
-        centers=means,
-        rgbs=final_rgbs, 
-        opacities=opacities,
-        covariances=covariances
-    )
-    
-    print(f"SUCCESS! Heatmap Overlay for '{args.query}' is ready.")
     print(f"Open your browser at: http://localhost:{args.port}")
     print(f"------------------------------------------------\n")
     
@@ -169,13 +201,12 @@ def main(args, dataset_args, pipeline_args):
         time.sleep(1.0)
 
 if __name__ == "__main__":
-    parser = ArgumentParser(description="Heatmap Overlay for Dr.Splat")
+    parser = ArgumentParser(description="Interactive Heatmap Overlay for Dr.Splat")
     lp = ModelParams(parser)
     op = PipelineParams(parser)
     
-    parser.add_argument("--query", type=str, required=True, help="Text to search for")
-    # Default threshold 0.20
-    parser.add_argument("--threshold", type=float, default=0.5, help="Similarity threshold") 
+    parser.add_argument("--query", type=str, default="", help="Initial text to search for (optional)")
+    parser.add_argument("--threshold", type=float, default=0.25, help="Initial similarity threshold") 
     parser.add_argument("--pq_index", type=str, required=True, help="Path to FAISS index")
     parser.add_argument("--port", type=int, default=8080, help="Viser server port")
     
