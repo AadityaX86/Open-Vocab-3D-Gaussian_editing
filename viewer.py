@@ -56,7 +56,7 @@ def apply_overlay_heatmap(similarities, base_rgbs, threshold=0.2, colormap_name=
 
 def main(args, dataset_args, pipeline_args):
     # 1. Setup & Load Models
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cpu"
     torch.cuda.empty_cache()
     
     print(f"\n[1/5] Loading OpenCLIP Model (ViT-B-16)...")
@@ -113,7 +113,7 @@ def main(args, dataset_args, pipeline_args):
 
     # Get Base RGBs (Photorealistic)
     shs = gaussians.get_features
-    base_rgbs_gpu = (shs[:, 0, :].detach() * 0.28209479177387814 + 0.5).clamp(0, 1)
+    base_rgbs_gpu = (shs[:, 0, :].detach() * 0.25 + 0.5).clamp(0, 1)
 
     # 4. Initialize Viser
     print(f"\n------------------------------------------------")
